@@ -11,7 +11,7 @@ Pure Crystal implementation of the HTTP/2 protocol.
 - [x] HTTP/1 to HTTP/2 server connection upgrades
 - [x] Integrate into `HTTP::Server`
 - [x] HTTP/2 client connections
-- [ ] Integrate into `HTTP::Client`
+- [x] Integrate into `HTTP::Client`
 - [x] Passes h2spec 2.6.0 💚
 
 To add HTTP/2 support to your HTTP servers written in Crystal, if they're built
@@ -41,7 +41,50 @@ server.bind_tls(host, port, context)
 server.listen
 ```
 
+## Client
+
+To add HTTP/2 support to `HTTP::Client`, require one file:
+
+```crystal
+require "http2/client"
+
+client = HTTP::Client.new("example.com", tls: true) # ALPN h2, else HTTP/1
+response = client.get("/")
+response.version # => "HTTP/2"
+
+client.post("/upload", body: File.open("data.bin")) do |response|
+  response.body_io.each_line { |line| puts line }
+end
+```
+
+Over TLS, the client negotiates HTTP/2 with ALPN and falls back to HTTP/1 when
+the server doesn't select `h2`. Under HTTP/2, concurrent requests share the
+connection, each on its own stream; under HTTP/1 they take turns.
+
+A cleartext connection uses HTTP/1, unless the server is known to speak HTTP/2
+(prior knowledge, RFC 9113 section 3.3):
+
+```crystal
+client = HTTP::Client.new("localhost", 8080, protocol: "h2")
+client = HTTP::Client.new(io, "example.com", protocol: "h2", scheme: "https")
+```
+
+`protocol: "h1"` keeps HTTP/1. The deprecated `h2c` upgrade isn't supported.
+
 ## Tests
+
+Run the test suite:
+
+```sh
+$ shards install
+$ make test
+```
+
+The client interoperability tests in `test/interop/` need nghttpd and the Go
+server in that directory; see `test/interop/client_test.cr`, and the
+`interop` job in `.github/workflows/ci.yml`.
+
+### h2spec
 
 Build and run the `bin/server` server, then execute
 [h2spec](https://github.com/summerwind/h2spec/releases).
