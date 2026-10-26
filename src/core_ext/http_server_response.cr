@@ -117,6 +117,8 @@ class HTTP2::Output < HTTP::Server::Response::Output
   def send_headers(description : String? = nil) : Nil
     @sent_headers = true
     @stream.send_headers(@headers)
+  rescue ex : IO::Error | HTTP2::Error
+    client_error("Error while writing headers to the client", ex)
   end
 
   def upgrade(protocol : String?, &block)
@@ -142,7 +144,8 @@ class HTTP2::Output < HTTP::Server::Response::Output
     # IO::Buffered#close instead
     flush if @out_count > 0
   ensure
-    unbuffered_close
+    # closed already, or by a failed flush: keep its error
+    unbuffered_close unless closed?
   end
 
   def unbuffered_write(slice : Bytes) : Nil
@@ -150,9 +153,15 @@ class HTTP2::Output < HTTP::Server::Response::Output
 
     @stream.send_data(slice)
     slice.size
-  rescue ex : IO::Error
-    unbuffered_close
-    raise HTTP::Server::ClientError.new("Error while writing data to the client", ex)
+  rescue ex : IO::Error | HTTP2::Error
+    client_error("Error while writing data to the client", ex)
+  end
+
+  # The stream is gone, reset by the client or closed with the connection:
+  # there's nothing to end, the handler gets the same error as for HTTP/1.
+  private def client_error(message, cause) : NoReturn
+    @closed = true
+    raise HTTP::Server::ClientError.new(message, cause)
   end
 
   def unbuffered_flush : Nil
@@ -162,6 +171,8 @@ class HTTP2::Output < HTTP::Server::Response::Output
     @closed = true
     @stream.send_data("", flags: Frame::Flags::END_STREAM)
     @stream.send_rst_stream(HTTP2::Error::Code::NO_ERROR)
+  rescue ex : IO::Error | HTTP2::Error
+    client_error("Error while closing the stream to the client", ex)
   end
 end
 

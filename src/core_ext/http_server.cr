@@ -208,7 +208,7 @@ class HTTP::Server
   ensure
     begin
       context.response.close
-    rescue ex : HTTP2::Error | IO::Error
+    rescue ex : HTTP::Server::ClientError | HTTP2::Error | IO::Error
       # silence
     end
   end
