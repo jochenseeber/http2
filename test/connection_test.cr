@@ -892,7 +892,7 @@ class HTTP2::ConnectionTest < Minitest::Test
     connection = Connection.new(IO::Stapled.new(IO::Memory.new, output), :server)
 
     output.error = NotAnIOError.new("protocol is shutdown")
-    error = assert_raises(IO::Error) { connection.write_settings }
+    error = assert_raises(IO::Error) { connection.send_goaway }
     assert_instance_of NotAnIOError, error.cause
     assert_equal "protocol is shutdown", error.message
   end
@@ -1210,6 +1210,359 @@ class HTTP2::ConnectionTest < Minitest::Test
     stream.send_rst_stream(Error::Code::NO_ERROR)
     error = assert_raises(Error) { connection.receive }
     assert_equal Error::Code::STREAM_CLOSED, error.code
+  end
+
+  def test_ignores_frames_in_flight_after_resetting_many_streams
+    input = IO::Memory.new
+    write_frame(input, Frame::Type::SETTINGS, Frame::Flags::None, 0, Bytes[0, 3, 0, 0, 0x05, 0xdc]) # max_concurrent_streams=1500
+    write_frame(input, Frame::Type::DATA, Frame::Flags::None, 1, "hello".to_slice)
+    write_frame(input, Frame::Type::DATA, Frame::Flags::None, 2999, "hello".to_slice)
+    input.rewind
+    connection = Connection.new(IO::Stapled.new(input, IO::Memory.new), :client)
+    connection.receive
+
+    # e.g. cancel every request in flight
+    1500.times do
+      connection.streams.create(state: Stream::State::HALF_CLOSED_LOCAL).send_rst_stream(Error::Code::CANCEL)
+    end
+    assert_nil connection.receive # stream 1
+    assert_nil connection.receive # stream 2999
+  end
+
+  def test_stops_ignoring_frames_on_the_oldest_reset_streams
+    input = IO::Memory.new
+    write_frame(input, Frame::Type::DATA, Frame::Flags::None, 3, "hello".to_slice)
+    write_frame(input, Frame::Type::DATA, Frame::Flags::None, 1, "hello".to_slice)
+    input.rewind
+    connection = Connection.new(IO::Stapled.new(input, IO::Memory.new), :client)
+
+    # remembers 1024 more reset streams than may be open at once: 100 for the
+    # peer, no limit announced for us
+    1125.times do
+      connection.streams.create(state: Stream::State::HALF_CLOSED_LOCAL).send_rst_stream(Error::Code::CANCEL)
+    end
+    assert_nil connection.receive # stream 3
+
+    # RFC 9113 section 5.1
+    error = assert_raises(Error) { connection.receive }
+    assert_equal Error::Code::STREAM_CLOSED, error.code
+  end
+
+  def test_server_ignores_frames_in_flight_on_streams_it_reset
+    encoder = HPACK::Encoder.new(indexing: HPACK::Indexing::ALWAYS, huffman: false)
+    request = HTTP::Headers{
+      ":method"    => "POST",
+      ":scheme"    => "http",
+      ":authority" => "example.com",
+      ":path"      => "/",
+    }
+    input = IO::Memory.new
+    write_frame(input, Frame::Type::HEADERS, Frame::Flags::END_HEADERS, 1, encoder.encode(request))
+    # sent by the client before it received the RST_STREAM
+    3.times { write_frame(input, Frame::Type::DATA, Frame::Flags::None, 1, Bytes.new(16384)) }
+    write_frame(input, Frame::Type::HEADERS, Frame::Flags::END_HEADERS | Frame::Flags::END_STREAM, 1,
+      encoder.encode(HTTP::Headers{"x-trailer" => "1"}))
+    # refers to the dynamic table entry the trailers above added
+    write_frame(input, Frame::Type::HEADERS, Frame::Flags::END_HEADERS | Frame::Flags::END_STREAM, 3,
+      encoder.encode(request.dup.tap { |headers| headers["x-trailer"] = "1" }))
+    input.rewind
+    output = IO::Memory.new
+    connection = Connection.new(IO::Stapled.new(input, output), :server)
+    stream1 = connection.receive.not_nil!.stream
+
+    stream1.send_rst_stream(Error::Code::CANCEL)
+    refute_same stream1, connection.streams.find(1), "stream 1 is still in the stream table"
+    4.times { assert_nil connection.receive }
+
+    frame = connection.receive.not_nil!
+    assert_equal 3, frame.stream.id
+    assert_equal "1", frame.stream.headers["x-trailer"]
+    # the ignored DATA still counts against the connection window
+    assert_equal [{0, DEFAULT_INITIAL_WINDOW_SIZE}], window_updates(output)
+  end
+
+  def test_server_ignores_frames_in_flight_on_a_stream_it_reset_below_the_last_one
+    encoder = HPACK::Encoder.new(indexing: HPACK::Indexing::ALWAYS, huffman: false)
+    request = HTTP::Headers{
+      ":method"    => "POST",
+      ":scheme"    => "http",
+      ":authority" => "example.com",
+      ":path"      => "/",
+    }
+    input = IO::Memory.new
+    write_frame(input, Frame::Type::HEADERS, Frame::Flags::END_HEADERS, 1, encoder.encode(request))
+    write_frame(input, Frame::Type::HEADERS, Frame::Flags::END_HEADERS, 3, encoder.encode(request))
+    # sent by the client before it received the RST_STREAM on stream 1
+    write_frame(input, Frame::Type::DATA, Frame::Flags::None, 1, Bytes.new(10))
+    write_frame(input, Frame::Type::HEADERS, Frame::Flags::END_HEADERS | Frame::Flags::END_STREAM, 1,
+      encoder.encode(HTTP::Headers{"x-trailer" => "1"}))
+    # refers to the dynamic table entry the trailers above added
+    write_frame(input, Frame::Type::HEADERS, Frame::Flags::END_HEADERS | Frame::Flags::END_STREAM, 5,
+      encoder.encode(request.dup.tap { |headers| headers["x-trailer"] = "1" }))
+    input.rewind
+    connection = Connection.new(IO::Stapled.new(input, IO::Memory.new), :server)
+    stream1 = connection.receive.not_nil!.stream
+    connection.receive
+
+    # e.g. an early response to stream 1 while stream 3 is open
+    stream1.send_rst_stream(Error::Code::NO_ERROR)
+    2.times { assert_nil connection.receive }
+
+    frame = connection.receive.not_nil!
+    assert_equal 5, frame.stream.id
+    assert_equal "1", frame.stream.headers["x-trailer"]
+  end
+
+  def test_client_forgets_closed_streams_and_keeps_their_body
+    connection, stream = client_closed_stream
+    assert_equal Stream::State::CLOSED, stream.state
+
+    forgotten = connection.streams.find(1)
+    refute_same stream, forgotten, "stream 1 is still in the stream table"
+    assert_equal Stream::State::CLOSED, forgotten.state
+    # whoever holds the stream may still read the body
+    assert_equal "hello", stream.data.gets_to_end
+  end
+
+  def test_client_treats_frames_on_forgotten_streams_as_closed
+    connection, stream = client_closed_stream do |input|
+      write_frame(input, Frame::Type::WINDOW_UPDATE, Frame::Flags::None, 1, Bytes[0, 0, 0, 1])
+      write_frame(input, Frame::Type::RST_STREAM, Frame::Flags::None, 1, Bytes[0, 0, 0, 0])
+      write_frame(input, Frame::Type::DATA, Frame::Flags::None, 1, "hello".to_slice)
+    end
+    refute_same stream, connection.streams.find(1), "stream 1 is still in the stream table"
+
+    # WINDOW_UPDATE and RST_STREAM may follow the end of a stream (RFC 9113
+    # section 5.1)
+    assert_equal Frame::Type::WINDOW_UPDATE, connection.receive.not_nil!.type
+    assert_equal Frame::Type::RST_STREAM, connection.receive.not_nil!.type
+
+    error = assert_raises(Error) { connection.receive }
+    assert_equal Error::Code::STREAM_CLOSED, error.code
+  end
+
+  def test_client_rejects_headers_on_forgotten_streams
+    connection, stream = client_closed_stream do |input|
+      write_frame(input, Frame::Type::HEADERS, Frame::Flags::END_HEADERS | Frame::Flags::END_STREAM, 1,
+        HPACK::Encoder.new(huffman: false).encode(HTTP::Headers{":status" => "200"}))
+    end
+    refute_same stream, connection.streams.find(1), "stream 1 is still in the stream table"
+
+    error = assert_raises(Error) { connection.receive }
+    assert_equal Error::Code::STREAM_CLOSED, error.code
+  end
+
+  def test_frames_on_a_forgotten_stream_share_one_stand_in
+    connection, stream = client_closed_stream do |input|
+      2.times { write_frame(input, Frame::Type::WINDOW_UPDATE, Frame::Flags::None, 1, Bytes[0, 0, 0, 1]) }
+      write_frame(input, Frame::Type::RST_STREAM, Frame::Flags::None, 1, Bytes[0, 0, 0, 0])
+    end
+    forgotten = connection.streams.find(1)
+    refute_same stream, forgotten, "stream 1 is still in the stream table"
+
+    3.times { assert_same forgotten, connection.receive.not_nil!.stream }
+    assert_same forgotten, connection.streams.find(1)
+    assert_equal 1, forgotten.id
+    assert_equal Stream::State::CLOSED, forgotten.state
+  end
+
+  def test_frames_on_forgotten_streams_in_turn_share_their_stand_ins
+    connection = Connection.new(IO::Stapled.new(IO::Memory.new, IO::Memory.new), :client)
+    # e.g. the DATA in flight on streams we reset, that the peer interleaves
+    ids = Array.new(3) do
+      connection.streams.create(state: Stream::State::HALF_CLOSED_LOCAL).tap(&.send_rst_stream(Error::Code::CANCEL)).id
+    end
+
+    stand_ins = ids.map { |id| connection.streams.find(id) }
+    ids.zip(stand_ins) do |id, stand_in|
+      assert_equal id, stand_in.id
+      assert stand_in.reset_sent?
+      assert_same stand_in, connection.streams.find(id)
+    end
+  end
+
+  def test_stand_in_forgets_the_reset_once_the_reset_stream_is_forgotten
+    input = IO::Memory.new
+    write_frame(input, Frame::Type::DATA, Frame::Flags::None, 1, "hello".to_slice)
+    input.rewind
+    connection = Connection.new(IO::Stapled.new(input, IO::Memory.new), :client)
+    connection.streams.create(state: Stream::State::HALF_CLOSED_LOCAL).send_rst_stream(Error::Code::CANCEL)
+    assert connection.streams.find(1).reset_sent?
+
+    # remembers 1024 more reset streams than may be open at once: 100 for the
+    # peer, no limit announced for us
+    1124.times do
+      connection.streams.create(state: Stream::State::HALF_CLOSED_LOCAL).send_rst_stream(Error::Code::CANCEL)
+    end
+    refute connection.streams.find(1).reset_sent?
+
+    error = assert_raises(Error) { connection.receive }
+    assert_equal Error::Code::STREAM_CLOSED, error.code
+  end
+
+  def test_ignores_window_updates_on_forgotten_streams
+    connection, output, _ = server_closed_stream do |input|
+      # each would overflow the window of an open stream
+      2.times { write_frame(input, Frame::Type::WINDOW_UPDATE, Frame::Flags::None, 1, Bytes[0x7f, 0xff, 0xff, 0xff]) }
+    end
+
+    # WINDOW_UPDATE may follow the end of a stream, and isn't an error then
+    # (RFC 9113 sections 5.1 and 6.9)
+    2.times { assert_equal Frame::Type::WINDOW_UPDATE, connection.receive.not_nil!.type }
+    assert_empty reset_streams(output)
+  end
+
+  # Receives a complete response to a GET request on stream 1, then gives
+  # *input* to the block to append frames.
+  private def client_closed_stream(&)
+    input = IO::Memory.new
+    write_frame(input, Frame::Type::HEADERS, Frame::Flags::END_HEADERS, 1,
+      HPACK::Encoder.new(huffman: false).encode(HTTP::Headers{":status" => "200"}))
+    write_frame(input, Frame::Type::DATA, Frame::Flags::END_STREAM, 1, "hello".to_slice)
+    yield input
+    input.rewind
+    connection = Connection.new(IO::Stapled.new(input, IO::Memory.new), :client)
+    stream = connection.streams.create
+    stream.send_headers(HTTP::Headers{
+      ":method"    => "GET",
+      ":scheme"    => "http",
+      ":authority" => "example.com",
+      ":path"      => "/",
+    }, Frame::Flags::END_STREAM)
+    2.times { connection.receive }
+    {connection, stream}
+  end
+
+  private def client_closed_stream
+    client_closed_stream { }
+  end
+
+  def test_sent_goaway_refuses_streams_above_last_stream_id
+    connection, output = server_receiving_requests(1, 3) { }
+    first = connection.receive.not_nil!
+    connection.send_goaway
+
+    # the stream above the last stream id isn't processed
+    assert_nil connection.receive
+    assert_equal [{1, Error::Code::NO_ERROR}], goaways(output)
+    assert_equal [{3, Error::Code::REFUSED_STREAM}], reset_streams(output)
+
+    # the stream at the last stream id completes
+    first.stream.send_headers(HTTP::Headers{":status" => "204"}, Frame::Flags::END_STREAM)
+    connection.close
+    assert_equal [{1, Error::Code::NO_ERROR}, {1, Error::Code::NO_ERROR}], goaways(output)
+  end
+
+  def test_sent_goaway_resets_open_streams_above_last_stream_id
+    connection, output = server_receiving_requests(1, 3) { }
+    first = connection.receive.not_nil!
+    third = connection.receive.not_nil!
+    connection.send_goaway(Error::Code::ENHANCE_YOUR_CALM, last_stream_id: 1)
+
+    assert_equal [{1, Error::Code::ENHANCE_YOUR_CALM}], goaways(output)
+    assert_equal [{3, Error::Code::REFUSED_STREAM}], reset_streams(output)
+    assert third.stream.state.closed?
+    assert first.stream.active?
+  end
+
+  def test_sent_goaway_never_raises_the_last_stream_id
+    connection, output = server_receiving_requests(1, 3) { }
+    2.times { connection.receive }
+    connection.send_goaway(last_stream_id: 1)
+    connection.send_goaway
+    connection.close
+    assert_equal 1, connection.goaway_sent_id
+    assert_equal [{1, Error::Code::NO_ERROR}] * 3, goaways(output)
+  end
+
+  # A server connection that receives a GET request on each stream of
+  # *ids*, then the frames the block appends to *input*. Returns the
+  # connection and its output.
+  private def server_receiving_requests(*ids, &)
+    input = IO::Memory.new
+    encoder = HPACK::Encoder.new(huffman: false)
+    ids.each do |id|
+      write_frame(input, Frame::Type::HEADERS, Frame::Flags::END_HEADERS | Frame::Flags::END_STREAM, id, encoder.encode(REQUEST))
+    end
+    yield input
+    input.rewind
+    output = IO::Memory.new
+    {Connection.new(IO::Stapled.new(input, output), :server), output}
+  end
+
+  def test_server_forgets_closed_streams
+    connection, output, stream = server_closed_stream { }
+    refute_same stream, connection.streams.find(1), "stream 1 is still in the stream table"
+
+    # the client must not retry the request: it was processed
+    connection.close
+    assert_equal [{1, Error::Code::NO_ERROR}], goaways(output)
+  end
+
+  def test_server_treats_frames_on_forgotten_streams_as_closed
+    connection, _, stream = server_closed_stream do |input, encoder|
+      write_frame(input, Frame::Type::HEADERS, Frame::Flags::END_HEADERS, 3, encoder.encode(REQUEST))
+      write_frame(input, Frame::Type::WINDOW_UPDATE, Frame::Flags::None, 1, Bytes[0, 0, 0, 1])
+      write_frame(input, Frame::Type::RST_STREAM, Frame::Flags::None, 1, Bytes[0, 0, 0, 0])
+      write_frame(input, Frame::Type::DATA, Frame::Flags::None, 1, "hello".to_slice)
+    end
+    refute_same stream, connection.streams.find(1), "stream 1 is still in the stream table"
+    assert_equal 3, connection.receive.not_nil!.stream.id
+
+    # a lower stream identifier than the last one opened, but not idle
+    assert_equal Frame::Type::WINDOW_UPDATE, connection.receive.not_nil!.type
+    assert_equal Frame::Type::RST_STREAM, connection.receive.not_nil!.type
+
+    error = assert_raises(Error) { connection.receive }
+    assert_equal Error::Code::STREAM_CLOSED, error.code
+  end
+
+  def test_server_rejects_headers_on_forgotten_streams
+    connection, _, stream = server_closed_stream do |input, encoder|
+      write_frame(input, Frame::Type::HEADERS, Frame::Flags::END_HEADERS | Frame::Flags::END_STREAM, 1, encoder.encode(REQUEST))
+    end
+    refute_same stream, connection.streams.find(1), "stream 1 is still in the stream table"
+
+    # not a new request on a reused stream identifier
+    error = assert_raises(Error) { connection.receive }
+    assert_equal Error::Code::STREAM_CLOSED, error.code
+  end
+
+  def test_server_rejects_new_stream_below_the_last_stream_identifier
+    encoder = HPACK::Encoder.new(huffman: false)
+    input = IO::Memory.new
+    write_frame(input, Frame::Type::HEADERS, Frame::Flags::END_HEADERS | Frame::Flags::END_STREAM, 5, encoder.encode(REQUEST))
+    write_frame(input, Frame::Type::HEADERS, Frame::Flags::END_HEADERS | Frame::Flags::END_STREAM, 3, encoder.encode(REQUEST))
+    input.rewind
+    connection = Connection.new(IO::Stapled.new(input, IO::Memory.new), :server)
+    connection.receive
+
+    # RFC 9113 section 5.1.1
+    error = assert_raises(Error) { connection.receive }
+    assert_equal Error::Code::PROTOCOL_ERROR, error.code
+  end
+
+  private REQUEST = HTTP::Headers{
+    ":method"    => "GET",
+    ":scheme"    => "http",
+    ":authority" => "example.com",
+    ":path"      => "/",
+  }
+
+  # Receives a GET request on stream 1 and responds to it, then gives *input*
+  # and the HPACK encoder to the block to append frames.
+  private def server_closed_stream(&)
+    encoder = HPACK::Encoder.new(huffman: false)
+    input = IO::Memory.new
+    write_frame(input, Frame::Type::HEADERS, Frame::Flags::END_HEADERS | Frame::Flags::END_STREAM, 1, encoder.encode(REQUEST))
+    yield input, encoder
+    input.rewind
+    output = IO::Memory.new
+    connection = Connection.new(IO::Stapled.new(input, output), :server)
+    stream = connection.receive.not_nil!.stream
+    stream.send_headers(HTTP::Headers{":status" => "204"}, Frame::Flags::END_STREAM)
+    assert_equal Stream::State::CLOSED, stream.state
+    {connection, output, stream}
   end
 
   def test_client_accepts_response_to_head_request_with_content_length
@@ -1767,306 +2120,6 @@ class HTTP2::ConnectionTest < Minitest::Test
     end
   end
 
-  def test_ignores_frames_in_flight_after_resetting_many_streams
-    input = IO::Memory.new
-    write_frame(input, Frame::Type::SETTINGS, Frame::Flags::None, 0, Bytes[0, 3, 0, 0, 0x05, 0xdc]) # max_concurrent_streams=1500
-    write_frame(input, Frame::Type::DATA, Frame::Flags::None, 1, "hello".to_slice)
-    write_frame(input, Frame::Type::DATA, Frame::Flags::None, 2999, "hello".to_slice)
-    input.rewind
-    connection = Connection.new(IO::Stapled.new(input, IO::Memory.new), :client)
-    connection.receive
-
-    # e.g. cancel every request in flight
-    1500.times do
-      connection.streams.create(state: Stream::State::HALF_CLOSED_LOCAL).send_rst_stream(Error::Code::CANCEL)
-    end
-    assert_nil connection.receive # stream 1
-    assert_nil connection.receive # stream 2999
-  end
-
-  def test_stops_ignoring_frames_on_the_oldest_reset_streams
-    input = IO::Memory.new
-    write_frame(input, Frame::Type::DATA, Frame::Flags::None, 3, "hello".to_slice)
-    write_frame(input, Frame::Type::DATA, Frame::Flags::None, 1, "hello".to_slice)
-    input.rewind
-    connection = Connection.new(IO::Stapled.new(input, IO::Memory.new), :client)
-
-    # remembers 1024 more reset streams than may be open at once: 100 for the
-    # peer, no limit announced for us
-    1125.times do
-      connection.streams.create(state: Stream::State::HALF_CLOSED_LOCAL).send_rst_stream(Error::Code::CANCEL)
-    end
-    assert_nil connection.receive # stream 3
-
-    # RFC 9113 section 5.1
-    error = assert_raises(Error) { connection.receive }
-    assert_equal Error::Code::STREAM_CLOSED, error.code
-  end
-
-  def test_server_ignores_frames_in_flight_on_streams_it_reset
-    encoder = HPACK::Encoder.new(indexing: HPACK::Indexing::ALWAYS, huffman: false)
-    request = HTTP::Headers{
-      ":method"    => "POST",
-      ":scheme"    => "http",
-      ":authority" => "example.com",
-      ":path"      => "/",
-    }
-    input = IO::Memory.new
-    write_frame(input, Frame::Type::HEADERS, Frame::Flags::END_HEADERS, 1, encoder.encode(request))
-    # sent by the client before it received the RST_STREAM
-    3.times { write_frame(input, Frame::Type::DATA, Frame::Flags::None, 1, Bytes.new(16384)) }
-    write_frame(input, Frame::Type::HEADERS, Frame::Flags::END_HEADERS | Frame::Flags::END_STREAM, 1,
-      encoder.encode(HTTP::Headers{"x-trailer" => "1"}))
-    # refers to the dynamic table entry the trailers above added
-    write_frame(input, Frame::Type::HEADERS, Frame::Flags::END_HEADERS | Frame::Flags::END_STREAM, 3,
-      encoder.encode(request.dup.tap { |headers| headers["x-trailer"] = "1" }))
-    input.rewind
-    output = IO::Memory.new
-    connection = Connection.new(IO::Stapled.new(input, output), :server)
-    stream1 = connection.receive.not_nil!.stream
-
-    stream1.send_rst_stream(Error::Code::CANCEL)
-    refute_same stream1, connection.streams.find(1), "stream 1 is still in the stream table"
-    4.times { assert_nil connection.receive }
-
-    frame = connection.receive.not_nil!
-    assert_equal 3, frame.stream.id
-    assert_equal "1", frame.stream.headers["x-trailer"]
-    # the ignored DATA still counts against the connection window
-    assert_equal [{0, DEFAULT_INITIAL_WINDOW_SIZE}], window_updates(output)
-  end
-
-  def test_server_ignores_frames_in_flight_on_a_stream_it_reset_below_the_last_one
-    encoder = HPACK::Encoder.new(indexing: HPACK::Indexing::ALWAYS, huffman: false)
-    request = HTTP::Headers{
-      ":method"    => "POST",
-      ":scheme"    => "http",
-      ":authority" => "example.com",
-      ":path"      => "/",
-    }
-    input = IO::Memory.new
-    write_frame(input, Frame::Type::HEADERS, Frame::Flags::END_HEADERS, 1, encoder.encode(request))
-    write_frame(input, Frame::Type::HEADERS, Frame::Flags::END_HEADERS, 3, encoder.encode(request))
-    # sent by the client before it received the RST_STREAM on stream 1
-    write_frame(input, Frame::Type::DATA, Frame::Flags::None, 1, Bytes.new(10))
-    write_frame(input, Frame::Type::HEADERS, Frame::Flags::END_HEADERS | Frame::Flags::END_STREAM, 1,
-      encoder.encode(HTTP::Headers{"x-trailer" => "1"}))
-    # refers to the dynamic table entry the trailers above added
-    write_frame(input, Frame::Type::HEADERS, Frame::Flags::END_HEADERS | Frame::Flags::END_STREAM, 5,
-      encoder.encode(request.dup.tap { |headers| headers["x-trailer"] = "1" }))
-    input.rewind
-    connection = Connection.new(IO::Stapled.new(input, IO::Memory.new), :server)
-    stream1 = connection.receive.not_nil!.stream
-    connection.receive
-
-    # e.g. an early response to stream 1 while stream 3 is open
-    stream1.send_rst_stream(Error::Code::NO_ERROR)
-    2.times { assert_nil connection.receive }
-
-    frame = connection.receive.not_nil!
-    assert_equal 5, frame.stream.id
-    assert_equal "1", frame.stream.headers["x-trailer"]
-  end
-
-  def test_client_forgets_closed_streams_and_keeps_their_body
-    connection, stream = client_closed_stream
-    assert_equal Stream::State::CLOSED, stream.state
-
-    forgotten = connection.streams.find(1)
-    refute_same stream, forgotten, "stream 1 is still in the stream table"
-    assert_equal Stream::State::CLOSED, forgotten.state
-    # whoever holds the stream may still read the body
-    assert_equal "hello", stream.data.gets_to_end
-  end
-
-  def test_client_treats_frames_on_forgotten_streams_as_closed
-    connection, stream = client_closed_stream do |input|
-      write_frame(input, Frame::Type::WINDOW_UPDATE, Frame::Flags::None, 1, Bytes[0, 0, 0, 1])
-      write_frame(input, Frame::Type::RST_STREAM, Frame::Flags::None, 1, Bytes[0, 0, 0, 0])
-      write_frame(input, Frame::Type::DATA, Frame::Flags::None, 1, "hello".to_slice)
-    end
-    refute_same stream, connection.streams.find(1), "stream 1 is still in the stream table"
-
-    # WINDOW_UPDATE and RST_STREAM may follow the end of a stream (RFC 9113
-    # section 5.1)
-    assert_equal Frame::Type::WINDOW_UPDATE, connection.receive.not_nil!.type
-    assert_equal Frame::Type::RST_STREAM, connection.receive.not_nil!.type
-
-    error = assert_raises(Error) { connection.receive }
-    assert_equal Error::Code::STREAM_CLOSED, error.code
-  end
-
-  def test_client_rejects_headers_on_forgotten_streams
-    connection, stream = client_closed_stream do |input|
-      write_frame(input, Frame::Type::HEADERS, Frame::Flags::END_HEADERS | Frame::Flags::END_STREAM, 1,
-        HPACK::Encoder.new(huffman: false).encode(HTTP::Headers{":status" => "200"}))
-    end
-    refute_same stream, connection.streams.find(1), "stream 1 is still in the stream table"
-
-    error = assert_raises(Error) { connection.receive }
-    assert_equal Error::Code::STREAM_CLOSED, error.code
-  end
-
-  def test_frames_on_a_forgotten_stream_share_one_stand_in
-    connection, stream = client_closed_stream do |input|
-      2.times { write_frame(input, Frame::Type::WINDOW_UPDATE, Frame::Flags::None, 1, Bytes[0, 0, 0, 1]) }
-      write_frame(input, Frame::Type::RST_STREAM, Frame::Flags::None, 1, Bytes[0, 0, 0, 0])
-    end
-    forgotten = connection.streams.find(1)
-    refute_same stream, forgotten, "stream 1 is still in the stream table"
-
-    3.times { assert_same forgotten, connection.receive.not_nil!.stream }
-    assert_same forgotten, connection.streams.find(1)
-    assert_equal 1, forgotten.id
-    assert_equal Stream::State::CLOSED, forgotten.state
-  end
-
-  def test_frames_on_forgotten_streams_in_turn_share_their_stand_ins
-    connection = Connection.new(IO::Stapled.new(IO::Memory.new, IO::Memory.new), :client)
-    # e.g. the DATA in flight on streams we reset, that the peer interleaves
-    ids = Array.new(3) do
-      connection.streams.create(state: Stream::State::HALF_CLOSED_LOCAL).tap(&.send_rst_stream(Error::Code::CANCEL)).id
-    end
-
-    stand_ins = ids.map { |id| connection.streams.find(id) }
-    ids.zip(stand_ins) do |id, stand_in|
-      assert_equal id, stand_in.id
-      assert stand_in.reset_sent?
-      assert_same stand_in, connection.streams.find(id)
-    end
-  end
-
-  def test_stand_in_forgets_the_reset_once_the_reset_stream_is_forgotten
-    input = IO::Memory.new
-    write_frame(input, Frame::Type::DATA, Frame::Flags::None, 1, "hello".to_slice)
-    input.rewind
-    connection = Connection.new(IO::Stapled.new(input, IO::Memory.new), :client)
-    connection.streams.create(state: Stream::State::HALF_CLOSED_LOCAL).send_rst_stream(Error::Code::CANCEL)
-    assert connection.streams.find(1).reset_sent?
-
-    # remembers 1024 more reset streams than may be open at once: 100 for the
-    # peer, no limit announced for us
-    1124.times do
-      connection.streams.create(state: Stream::State::HALF_CLOSED_LOCAL).send_rst_stream(Error::Code::CANCEL)
-    end
-    refute connection.streams.find(1).reset_sent?
-
-    error = assert_raises(Error) { connection.receive }
-    assert_equal Error::Code::STREAM_CLOSED, error.code
-  end
-
-  def test_ignores_window_updates_on_forgotten_streams
-    connection, output, _ = server_closed_stream do |input|
-      # each would overflow the window of an open stream
-      2.times { write_frame(input, Frame::Type::WINDOW_UPDATE, Frame::Flags::None, 1, Bytes[0x7f, 0xff, 0xff, 0xff]) }
-    end
-
-    # WINDOW_UPDATE may follow the end of a stream, and isn't an error then
-    # (RFC 9113 sections 5.1 and 6.9)
-    2.times { assert_equal Frame::Type::WINDOW_UPDATE, connection.receive.not_nil!.type }
-    assert_empty reset_streams(output)
-  end
-
-  # Receives a complete response to a GET request on stream 1, then gives
-  # *input* to the block to append frames.
-  private def client_closed_stream(&)
-    input = IO::Memory.new
-    write_frame(input, Frame::Type::HEADERS, Frame::Flags::END_HEADERS, 1,
-      HPACK::Encoder.new(huffman: false).encode(HTTP::Headers{":status" => "200"}))
-    write_frame(input, Frame::Type::DATA, Frame::Flags::END_STREAM, 1, "hello".to_slice)
-    yield input
-    input.rewind
-    connection = Connection.new(IO::Stapled.new(input, IO::Memory.new), :client)
-    stream = connection.streams.create
-    stream.send_headers(HTTP::Headers{
-      ":method"    => "GET",
-      ":scheme"    => "http",
-      ":authority" => "example.com",
-      ":path"      => "/",
-    }, Frame::Flags::END_STREAM)
-    2.times { connection.receive }
-    {connection, stream}
-  end
-
-  private def client_closed_stream
-    client_closed_stream { }
-  end
-
-  def test_server_forgets_closed_streams
-    connection, output, stream = server_closed_stream { }
-    refute_same stream, connection.streams.find(1), "stream 1 is still in the stream table"
-
-    # the client must not retry the request: it was processed
-    connection.close
-    assert_equal [{1, Error::Code::NO_ERROR}], goaways(output)
-  end
-
-  def test_server_treats_frames_on_forgotten_streams_as_closed
-    connection, _, stream = server_closed_stream do |input, encoder|
-      write_frame(input, Frame::Type::HEADERS, Frame::Flags::END_HEADERS, 3, encoder.encode(REQUEST))
-      write_frame(input, Frame::Type::WINDOW_UPDATE, Frame::Flags::None, 1, Bytes[0, 0, 0, 1])
-      write_frame(input, Frame::Type::RST_STREAM, Frame::Flags::None, 1, Bytes[0, 0, 0, 0])
-      write_frame(input, Frame::Type::DATA, Frame::Flags::None, 1, "hello".to_slice)
-    end
-    refute_same stream, connection.streams.find(1), "stream 1 is still in the stream table"
-    assert_equal 3, connection.receive.not_nil!.stream.id
-
-    # a lower stream identifier than the last one opened, but not idle
-    assert_equal Frame::Type::WINDOW_UPDATE, connection.receive.not_nil!.type
-    assert_equal Frame::Type::RST_STREAM, connection.receive.not_nil!.type
-
-    error = assert_raises(Error) { connection.receive }
-    assert_equal Error::Code::STREAM_CLOSED, error.code
-  end
-
-  def test_server_rejects_headers_on_forgotten_streams
-    connection, _, stream = server_closed_stream do |input, encoder|
-      write_frame(input, Frame::Type::HEADERS, Frame::Flags::END_HEADERS | Frame::Flags::END_STREAM, 1, encoder.encode(REQUEST))
-    end
-    refute_same stream, connection.streams.find(1), "stream 1 is still in the stream table"
-
-    # not a new request on a reused stream identifier
-    error = assert_raises(Error) { connection.receive }
-    assert_equal Error::Code::STREAM_CLOSED, error.code
-  end
-
-  def test_server_rejects_new_stream_below_the_last_stream_identifier
-    encoder = HPACK::Encoder.new(huffman: false)
-    input = IO::Memory.new
-    write_frame(input, Frame::Type::HEADERS, Frame::Flags::END_HEADERS | Frame::Flags::END_STREAM, 5, encoder.encode(REQUEST))
-    write_frame(input, Frame::Type::HEADERS, Frame::Flags::END_HEADERS | Frame::Flags::END_STREAM, 3, encoder.encode(REQUEST))
-    input.rewind
-    connection = Connection.new(IO::Stapled.new(input, IO::Memory.new), :server)
-    connection.receive
-
-    # RFC 9113 section 5.1.1
-    error = assert_raises(Error) { connection.receive }
-    assert_equal Error::Code::PROTOCOL_ERROR, error.code
-  end
-
-  private REQUEST = HTTP::Headers{
-    ":method"    => "GET",
-    ":scheme"    => "http",
-    ":authority" => "example.com",
-    ":path"      => "/",
-  }
-
-  # Receives a GET request on stream 1 and responds to it, then gives *input*
-  # and the HPACK encoder to the block to append frames.
-  private def server_closed_stream(&)
-    encoder = HPACK::Encoder.new(huffman: false)
-    input = IO::Memory.new
-    write_frame(input, Frame::Type::HEADERS, Frame::Flags::END_HEADERS | Frame::Flags::END_STREAM, 1, encoder.encode(REQUEST))
-    yield input, encoder
-    input.rewind
-    output = IO::Memory.new
-    connection = Connection.new(IO::Stapled.new(input, output), :server)
-    stream = connection.receive.not_nil!.stream
-    stream.send_headers(HTTP::Headers{":status" => "204"}, Frame::Flags::END_STREAM)
-    assert_equal Stream::State::CLOSED, stream.state
-    {connection, output, stream}
-  end
-
   # Fails the next write of a frame payload when armed, once.
   private class FailingWriter < IO
     property? fail_next_payload = false
@@ -2101,6 +2154,25 @@ class HTTP2::ConnectionTest < Minitest::Test
       end
     end
     updates
+  end
+
+  # Parses the GOAWAY frames written to *io* as {last_stream_id, error_code}.
+  private def goaways(io : IO::Memory)
+    io.rewind
+    frames = [] of {Int32, Error::Code}
+    while io.pos < io.size
+      header = io.read_bytes(UInt32, IO::ByteFormat::BigEndian)
+      size, type = header >> 8, header & 0xff
+      io.skip(5) # flags, stream id
+      if type == Frame::Type::GOAWAY.value
+        last_stream_id = io.read_bytes(UInt32, IO::ByteFormat::BigEndian).to_i32 & 0x7fffffff
+        frames << {last_stream_id, Error::Code.new(io.read_bytes(UInt32, IO::ByteFormat::BigEndian))}
+        io.skip(size - 8)
+      else
+        io.skip(size)
+      end
+    end
+    frames
   end
 
   # Parses the RST_STREAM frames written to *io* as {stream_id, error_code}.
@@ -2139,24 +2211,5 @@ class HTTP2::ConnectionTest < Minitest::Test
       end
     end
     promises
-  end
-
-  # Parses the GOAWAY frames written to *io* as {last_stream_id, error_code}.
-  private def goaways(io : IO::Memory)
-    io.rewind
-    frames = [] of {Int32, Error::Code}
-    while io.pos < io.size
-      header = io.read_bytes(UInt32, IO::ByteFormat::BigEndian)
-      size, type = header >> 8, header & 0xff
-      io.skip(5) # flags, stream id
-      if type == Frame::Type::GOAWAY.value
-        last_stream_id = io.read_bytes(UInt32, IO::ByteFormat::BigEndian).to_i32 & 0x7fffffff
-        frames << {last_stream_id, Error::Code.new(io.read_bytes(UInt32, IO::ByteFormat::BigEndian))}
-        io.skip(size - 8)
-      else
-        io.skip(size)
-      end
-    end
-    frames
   end
 end

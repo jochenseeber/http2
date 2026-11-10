@@ -15,6 +15,7 @@ class HTTP2::ServerTest < Minitest::Test
     spawn { server.listen }
 
     socket = TCPSocket.new("127.0.0.1", listener.local_address.port)
+    socket.read_timeout = 5.seconds
     client = Connection.new(socket, :client)
     client.write_client_preface
     client.write_settings
@@ -37,10 +38,10 @@ class HTTP2::ServerTest < Minitest::Test
     receive_until(client) { |frame| frame.stream.id == 1 && frame.flags.end_stream? }
     assert_equal "hello world", stream.data.gets_to_end
 
-    # no stream left: the server closes the connection
-    write_frame(socket, Frame::Type::PING, Frame::Flags::None, 0, Bytes.new(8))
+    # no stream left: the server closes the connection, without waiting for
+    # another frame from the client
     receive_until(client) { |frame| frame.type.goaway? }
-    assert_raises(IO::Error) { loop { client.receive } }
+    assert_raises(IO::EOFError) { loop { client.receive } }
   ensure
     release.try(&.close)
     socket.try(&.close)

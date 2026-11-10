@@ -55,6 +55,12 @@ module HTTP2
     private getter io : IO
     getter streams : Streams
 
+    # The stream of the last frame `#receive` read, even if it returned
+    # `nil`: for example the stream it reset because the frame made the
+    # request or response malformed. Only for the fiber that receives
+    # frames.
+    getter last_received_stream : Stream? = nil
+
     @data_buffer : Bytes? = nil
 
     # The SETTINGS_ENABLE_PUSH value of each SETTINGS frame we sent that the
@@ -92,6 +98,7 @@ module HTTP2
 
       @closed = false
       @write_failed = false
+      @goaway_sent_id = Atomic(Int32).new(-1)
 
       # the peer's SETTINGS_HEADER_TABLE_SIZE bounds our encoder, ours bounds
       # our decoder (RFC 9113 section 4.3.1)
@@ -157,13 +164,14 @@ module HTTP2
     # stream after we reset it or an interim (1xx) response on a client, or
     # when it made the request or response malformed and the stream was reset,
     # or a PUSH_PROMISE whose promised stream we refused.
+    # `#last_received_stream` is then the frame's stream.
     #
     # A PUSH_PROMISE frame is reported on the stream it was sent on; the
     # promised stream, with the promised request headers, is
     # `Frame#promised_stream`.
     def receive : Frame?
       frame = read_frame_header
-      stream = frame.stream
+      stream = @last_received_stream = frame.stream
 
       # an unknown frame type is ignored, on any stream, without changing
       # its state (RFC 9113 sections 4.1 and 5.5)
@@ -195,6 +203,14 @@ module HTTP2
       when Frame::Type::HEADERS
         raise Error.protocol_error if stream.id == 0
         return unless read_headers_frame(frame)
+
+        # we sent GOAWAY: we don't process a stream the peer opened above
+        # its last stream id (RFC 9113 section 6.8)
+        if (last_stream_id = goaway_sent_id) && stream.id > last_stream_id && @type.peer.initiates?(stream.id)
+          stream.send_rst_stream(Error::Code::REFUSED_STREAM)
+          stream.abort
+          return
+        end
 
       when Frame::Type::PUSH_PROMISE
         raise Error.protocol_error if stream.id == 0
@@ -933,6 +949,80 @@ module HTTP2
       streams.each(&.resume_senders)
     end
 
+    # The last stream identifier of the GOAWAY frames we sent with
+    # `#send_goaway`, if any.
+    def goaway_sent_id : Int32?
+      id = @goaway_sent_id.get
+      id unless id < 0
+    end
+
+    # Sends GOAWAY without closing the connection, for a graceful shutdown
+    # (RFC 9113 section 6.8): the peer must not open new streams, and we
+    # don't process the streams it opens above *last_stream_id*, that it
+    # may retry on another connection. The streams at or below it may
+    # complete. Unlike `#close`, the connection keeps working.
+    #
+    # *last_stream_id* defaults to the last stream the peer opened. Resets
+    # the streams the peer opened above it (REFUSED_STREAM). Returns the last
+    # stream identifier sent, that a later GOAWAY never raises.
+    #
+    # Waits while another frame is being written.
+    def send_goaway(error_code : Error::Code = Error::Code::NO_ERROR, last_stream_id : Int32? = nil, debug_data : String = "") : Int32
+      last_stream_id, refused = synchronize do
+        id = goaway_last_stream_id(last_stream_id)
+        write goaway_frame(id, error_code, debug_data)
+        @goaway_sent_id.set(id)
+        {id, streams.peer_streams_above(id)}
+      end
+
+      refused.each do |stream|
+        stream.send_rst_stream(Error::Code::REFUSED_STREAM) unless stream.state.closed?
+        stream.abort
+      end
+      last_stream_id
+    end
+
+    # The last stream identifier of a GOAWAY: *requested*, or the last stream
+    # the peer opened, but no higher than one we sent before (RFC 9113 section
+    # 6.8).
+    private def goaway_last_stream_id(requested : Int32? = nil) : Int32
+      last_stream_id = requested || streams.last_stream_id
+      if (sent = goaway_sent_id) && sent < last_stream_id
+        last_stream_id = sent
+      end
+      last_stream_id
+    end
+
+    # Yields while no frame is being written, so the block can shut down the
+    # sending side of the IO between two frames, for example once every
+    # stream is done after `#send_goaway`.
+    def close_write(&) : Nil
+      @mutex.to_reference.synchronize { yield }
+    end
+
+    # Opens stream 1 for the HTTP/1.1 request that upgraded the connection to
+    # HTTP/2 (h2c), on a server. The client sent the whole request over
+    # HTTP/1.1, so the stream is half-closed (remote) and only carries the
+    # response (RFC 7540 section 3.2).
+    def upgrade_stream : Stream
+      streams.find(1).tap do |stream|
+        stream.receiving(Frame.new(Frame::Type::HEADERS, stream, Frame::Flags::END_STREAM))
+      end
+    end
+
+    # The number of streams the peer opened that are still in progress.
+    def active_peer_streams : Int32
+      streams.active_count(@type.peer)
+    end
+
+    private def goaway_frame(last_stream_id : Int32, code : Error::Code, message : String = "") : Frame
+      payload = IO::Memory.new(8 + message.bytesize)
+      payload.write_bytes(last_stream_id.to_u32, IO::ByteFormat::BigEndian)
+      payload.write_bytes(code.to_u32, IO::ByteFormat::BigEndian)
+      payload << message
+      Frame.new(Frame::Type::GOAWAY, streams.find(0), payload: payload.to_slice)
+    end
+
     # Terminates the HTTP/2 connection.
     #
     # This will send a GOAWAY frame if *notify* is true, reporting an
@@ -957,12 +1047,7 @@ module HTTP2
               message, code = "", Error::Code::NO_ERROR
             end
 
-            payload = IO::Memory.new(8 + message.bytesize)
-            payload.write_bytes(streams.last_stream_id.to_u32, IO::ByteFormat::BigEndian)
-            payload.write_bytes(code.to_u32, IO::ByteFormat::BigEndian)
-            payload << message
-
-            write Frame.new(Frame::Type::GOAWAY, streams.find(0), payload: payload.to_slice)
+            write goaway_frame(goaway_last_stream_id, code, message)
           end
         end
       end

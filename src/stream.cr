@@ -55,7 +55,9 @@ module HTTP2
     # even-numbered for server initiated streams (server-push).
     getter id : Int32
     property priority : Priority
-    private getter connection : Connection
+
+    # The connection of the stream.
+    getter connection : Connection
 
     @outbound_window_size : Int32
 

@@ -1,17 +1,25 @@
 require "http/request"
 
 class HTTP::Request
+  @scheme : String? = nil
+
   # :nodoc:
   #
-  # Custom constructor to create Request from HTTP1::Connection and
-  # HTTP2::Connection alike, avoiding to dup *headers* for example.
+  # Custom constructor to create a Request from the headers of an HTTP/2
+  # stream, avoiding to dup *headers* for example.
   def initialize(@headers : Headers, @body : IO?, @version : String)
     @method = headers[":method"]
     @resource = headers[":path"]
   end
 
+  # The scheme of the request: `:scheme` over HTTP/2; `http` or `https`
+  # over HTTP/1, after the connection.
   def scheme : String?
-    @headers[":scheme"]?
+    @headers[":scheme"]? || @scheme
+  end
+
+  # :nodoc:
+  def scheme=(@scheme : String?)
   end
 
   def authority : String?

@@ -19,3 +19,8 @@ ssl: .PHONY
 
 test: .PHONY
 	$(CRYSTAL) run $(CRFLAGS) $(TESTS) -- $(OPTS)
+
+# the HTTP/1 contract, against the stdlib's server and the shard's
+contract: .PHONY
+	$(CRYSTAL) run $(CRFLAGS) -Dstdlib_server test/contract/http1_contract_test.cr -- $(OPTS)
+	$(CRYSTAL) run $(CRFLAGS) test/contract/http1_contract_test.cr -- $(OPTS)

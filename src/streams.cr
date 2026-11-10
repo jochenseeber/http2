@@ -163,12 +163,25 @@ module HTTP2
       end
     end
 
+    # Returns true once the peer sent GOAWAY: it won't open new streams.
+    def goaway? : Bool
+      @lock.read { @goaway }
+    end
+
     # Refuses to create streams once the peer sent GOAWAY. Returns the streams
     # we opened above *last_stream_id*, that the peer won't process.
     protected def goaway(last_stream_id : Int32) : Array(Stream)
       @lock.write do
         @goaway = true
         @streams.values.select { |stream| @type.initiates?(stream.id) && stream.id > last_stream_id }
+      end
+    end
+
+    # The streams the peer opened above *last_stream_id*, that we won't
+    # process after we sent GOAWAY.
+    protected def peer_streams_above(last_stream_id : Int32) : Array(Stream)
+      @lock.read do
+        @streams.values.select { |stream| @type.peer.initiates?(stream.id) && stream.id > last_stream_id }
       end
     end
 

@@ -33,6 +33,7 @@ jobs:
           crystal: ${{ matrix.crystal }}
       - run: shards install
       - run: timeout 5m make test CRFLAGS="${{ matrix.crflags }}"
+      - run: timeout 5m make contract CRFLAGS="${{ matrix.crflags }}"
 
   h2spec:
     runs-on: ubuntu-24.04
@@ -61,3 +62,40 @@ jobs:
       - run: ./bin/h2spec --version
       - run: timeout 5m ./bin/h2spec --strict --port 9292 --tls --insecure
 
+  interop:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: crystal-lang/install-crystal@v1
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - run: sudo apt-get update && sudo apt-get install -y nghttp2-server
+      - run: shards install
+      - run: make ssl
+      - run: mkdir -p bin && cd test/interop && go build -o ../../bin/interop-server .
+
+      - run: mkdir -p /tmp/www && head -c 1024 /dev/urandom > /tmp/www/1k.bin && head -c 1048576 /dev/urandom > /tmp/www/1m.bin
+      - run: nghttpd --no-tls -d /tmp/www 8080 &
+      - run: nghttpd -d /tmp/www 8443 ssl/server.key ssl/server.crt &
+      - run: ./bin/interop-server -h2c :9080 -tls :9443 &
+      - run: for port in 8080 8443 9080 9443; do timeout 30 sh -c "until nc -z 127.0.0.1 $port; do sleep 1; done"; done
+
+      - run: H2_INTEROP=1 timeout 5m crystal run test/interop/client_test.cr -- --chaos --parallel 4
+
+  server_interop:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: crystal-lang/install-crystal@v1
+
+      - run: sudo apt-get update && sudo apt-get install -y nghttp2-client
+      - run: make bin/server
+      - run: make ssl
+      - run: PORT=9292 ./bin/server &
+      - run: PORT=9293 TLS=1 ./bin/server &
+      - run: for port in 9292 9293; do timeout 30 sh -c "until nc -z 127.0.0.1 $port; do sleep 1; done"; done
+
+      - run: timeout 5m test/interop/server_check.sh http 9292
+      - run: timeout 5m test/interop/server_check.sh https 9293

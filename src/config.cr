@@ -1,4 +1,19 @@
 module HTTP2
+  # :nodoc:
+  #
+  # Spawns a fiber of a connection. Under the legacy `-Dpreview_mt`
+  # scheduler each thread has its own event loop, and a socket can't move
+  # between them while a fiber waits on it: the fiber runs on the current
+  # thread, so the fibers of a connection share one. Execution contexts
+  # don't need it.
+  macro spawn(*, name = nil, &block)
+    {% if flag?(:preview_mt) && !flag?(:execution_context) %}
+      ::spawn(name: {{name}}, same_thread: true) {{block}}
+    {% else %}
+      ::spawn(name: {{name}}) {{block}}
+    {% end %}
+  end
+
   CLIENT_PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 
   MINIMUM_FRAME_SIZE =    16384 # 2 ** 14

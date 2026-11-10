@@ -11,7 +11,7 @@ Pure Crystal implementation of the HTTP/2 protocol.
 - [x] HTTP/1 to HTTP/2 server connection upgrades
 - [x] Integrate into `HTTP::Server`
 - [x] HTTP/2 client connections
-- [ ] Integrate into `HTTP::Client`
+- [x] Integrate into `HTTP::Client`
 - [x] Passes h2spec 2.6.0 💚
 
 To add HTTP/2 support to your HTTP servers written in Crystal, if they're built
@@ -41,6 +41,119 @@ server.bind_tls(host, port, context)
 server.listen
 ```
 
+A server speaks HTTP/2 over cleartext connections too (h2c), to a client that
+starts with the HTTP/2 preface or asks for `Upgrade: h2c`. To speak only
+HTTP/1.1 on cleartext connections, turn it off; HTTP/2 over TLS is not affected:
+
+```crystal
+server.h2c = false
+```
+
+A handler reaches the HTTP/2 connection of its request, for example to shut it
+down gracefully with GOAWAY: the client opens no new stream on it, the streams
+in flight complete, then the connection closes.
+
+```crystal
+context.http2_connection.try(&.send_goaway)
+```
+
+A handler can also end its response at once without completing it. Under
+HTTP/2 the stream is reset with RST_STREAM and the given error code, while the
+other streams on the connection go on. HTTP/1 has no stream to reset, so the
+response is cut off and the connection closed:
+
+```crystal
+context.response.reset_stream(:protocol_error)
+```
+
+`HTTP::Server#close` stops accepting connections and lets the requests in
+progress finish, for up to `close_timeout`, but returns at once. To wait until
+every connection has ended and every handler has returned, HTTP/2 stream
+handlers included, call `#wait_closed`. It returns false if some are still
+running once `close_timeout` (plus a second) has passed:
+
+```crystal
+server.close
+server.wait_closed
+```
+
+### Differences from the stdlib's `HTTP::Server`
+
+Requiring `http2/server` adds HTTP/2 to `HTTP::Server`. HTTP/1 connections are
+still served by the stdlib's `HTTP::Server::RequestProcessor`, so handlers see
+the stdlib's behaviour, `Response#upgrade` included (its block runs once the
+handler returned; an HTTP/2 stream can't be upgraded: it raises
+`NotImplementedError`). The server adds, over HTTP/1:
+
+- A request with several `Host` header fields, or with content lengths that
+  differ, or with a `Content-Length` and a `Transfer-Encoding`, is answered
+  with `400 Bad Request` and the connection closed (RFC 9112 sections 3.2 and
+  6.3).
+- A 1xx, 204 or 304 response has no body, and no chunked framing.
+- `Response#flush` before the first byte of the body sends the status and the
+  headers, as over HTTP/2, so a client can wait on a stream. The body is then
+  chunked, unless it has a `Content-Length`; over HTTP/1.0 the connection is
+  closed after it.
+- A gzip or deflate request body is decoded, as over HTTP/2.
+- A handler that fails after the headers were sent cuts the response off,
+  without its last chunk, so the client can tell it's incomplete (RFC 9112
+  section 7.1); a 500 says `Connection: close`.
+- `HTTP::Server#close` ends idle keep-alive connections at once, and
+  `#wait_closed` waits for the others.
+- The requests have their `remote_address` and `local_address` on Crystal
+  versions whose stdlib doesn't set them yet.
+
+The contract tests in `test/contract/` check this against the stdlib's server:
+`make contract`.
+
+A TLS connection over an IO that isn't a `::Socket`, for example from an
+`OpenSSL::SSL::Server` over another kind of listener, doesn't use kernel TLS,
+which the standard library supports over sockets only: the server and the
+client turn the context's `ENABLE_KTLS` option off for it.
+
+## Client
+
+To add HTTP/2 support to `HTTP::Client`, require one file:
+
+```crystal
+require "http2/client"
+
+client = HTTP::Client.new("example.com", tls: true) # ALPN h2, else HTTP/1
+response = client.get("/")
+response.version # => "HTTP/2"
+
+client.post("/upload", body: File.open("data.bin")) do |response|
+  response.body_io.each_line { |line| puts line }
+end
+```
+
+Over TLS, the client negotiates HTTP/2 with ALPN and falls back to HTTP/1 when
+the server doesn't select `h2`. Under HTTP/2, concurrent requests share the
+connection, each on its own stream; under HTTP/1 they take turns.
+
+A cleartext connection uses HTTP/1, unless the server is known to speak HTTP/2
+(prior knowledge, RFC 9113 section 3.3):
+
+```crystal
+client = HTTP::Client.new("localhost", 8080, protocol: "h2")
+client = HTTP::Client.new(io, "example.com", protocol: "h2", scheme: "https")
+```
+
+`protocol: "h1"` keeps HTTP/1. The deprecated `h2c` upgrade isn't supported.
+
+A cancellation gives up on one request: under HTTP/2, its stream is reset and
+the other requests go on. Under HTTP/1, the request has the connection to
+itself, so the connection is closed; the next request connects again.
+
+```crystal
+cancellation = HTTP::Client::Cancellation.new(timeout: 5.seconds)
+client.exec(HTTP::Request.new("HEAD", "/"), cancellation: cancellation)
+
+cancellation = HTTP::Client::Cancellation.new
+spawn { client.exec(HTTP::Request.new("GET", "/events"), cancellation: cancellation) { |response| ... } }
+cancellation.cancel # the request raises HTTP2::Error (CANCEL)
+```
+
 ## Concurrency
 
 An HTTP/2 connection is shared by several fibers: the one that receives
@@ -67,10 +180,34 @@ frames, and the ones that send requests, responses and bodies. Who owns what:
 The library is synchronized for multi-threaded execution contexts, but
 `OpenSSL::SSL::Socket` isn't: its reads and writes must not run in parallel.
 Keep TLS connections on one thread: run a TLS server in a single-threaded
-execution context. Under the legacy `-Dpreview_mt` scheduler, without execution
-contexts, TLS connections can't be confined to one thread.
+execution context, and use a TLS client from the execution context that made
+its first request, if that context is single-threaded (see `HTTP::Client`).
+Under the legacy `-Dpreview_mt` scheduler, each thread has its own event loop,
+and a socket can't move between them while a fiber waits on it. The library
+spawns the fibers of a connection on the thread that starts them, so a server's
+connection and its handlers share one thread. Use a client from one thread: the
+fibers making requests with it must run on the same thread, for example spawned
+with `same_thread: true`. The suite's TLS tests don't run under `-Dpreview_mt`.
 
 ## Tests
+
+Run the test suite:
+
+```sh
+$ shards install
+$ make test
+```
+
+The client interoperability tests in `test/interop/` need nghttpd and the Go
+server in that directory; see `test/interop/client_test.cr`, and the
+`interop` job in `.github/workflows/ci.yml`. The server is checked with curl,
+nghttp and h2load by `test/interop/server_check.sh`, against `bin/server`
+over cleartext and TLS (the `server_interop` job).
+
+CI runs the suite on the minimum Crystal version `shard.yml` declares and on
+the latest release, and once with `CRFLAGS=-Dexecution_context`.
+
+### h2spec
 
 Build and run the `bin/server` server, then execute
 [h2spec](https://github.com/summerwind/h2spec/releases).
@@ -91,8 +228,11 @@ $ TLS=1 bin/server
 $ ./h2spec -p 9292 -k -t -S
 ```
 
-NOTE: h2spec hasn't been updated since 2020 while a revised version
-of the HTTP/2 RFC was released in 2022 (RFC 9113).
+NOTE: h2spec 2.6.0 targets RFC 7540: it hasn't been updated since 2020, while
+RFC 9113 revised HTTP/2 in 2022. The library's own tests cover what RFC 9113
+changed or made stricter, for example field validation (section 8.2) and
+unknown frame types (section 5.5), in `test/connection_test.cr` and
+`test/framing_test.cr`.
 
 ## RFC
 
